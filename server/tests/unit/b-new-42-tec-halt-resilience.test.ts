@@ -84,8 +84,9 @@ vi.mock('../../services/trade-safety.js', () => ({
 //
 // DO NOT remove this mock without a time-injection replacement. See
 // b-new-42-tec-split-resilience.test.ts header for the full rationale.
+const venue = vi.hoisted(() => ({ open: true }));
 vi.mock('../../asset_classes/xstock_spot/market-hours.js', () => ({
-  isXstockMarketOpenUTC: () => true,
+  isXstockMarketOpenUTC: () => venue.open,
 }));
 
 import { evaluateTECExit } from '../../services/tec-evaluator.js';
@@ -152,6 +153,7 @@ const xstockContext = {
 
 describe('B-NEW-42 §2.3.3 — TEC halt-resilience (VERIFIES B-NEW-42b FIX)', () => {
   beforeEach(async () => {
+    venue.open = true;
     seedXstockUniverse();
     clearModuleConstantsCache();
     seedAllConstants();
@@ -269,6 +271,7 @@ describe('B-NEW-42 §2.3.3 — TEC halt-resilience (VERIFIES B-NEW-42b FIX)', ()
       currentTs: t0,
     });
     expect(preHalt.shouldExit).toBe(false);
+    expect(preHalt.priceLevelChecksDeferred).toBe(true);
 
     // Need a steady-state tick to populate the cache after cold-start; without
     // this, the next call would still be cold-start (cache populated but state
@@ -285,6 +288,7 @@ describe('B-NEW-42 §2.3.3 — TEC halt-resilience (VERIFIES B-NEW-42b FIX)', ()
       currentTs: t0 + 60_000,
     });
     expect(steadyState.shouldExit).toBe(false);
+    expect(steadyState.priceLevelChecksDeferred).toBeUndefined();
 
     // Step 2 (skipped — halt window has no ticks; would be no-op calls).
 
@@ -308,6 +312,7 @@ describe('B-NEW-42 §2.3.3 — TEC halt-resilience (VERIFIES B-NEW-42b FIX)', ()
     // false. Trade stays open through the discontinuity window; next
     // confirming tick within the 30s clearing window transitions to IDLE.
     expect(postResume.shouldExit).toBe(false);
+    expect(postResume.priceLevelChecksDeferred).toBe(true);
 
     // Langston Step 4 review recommendation: ensure the gate fired for the
     // INTENDED reason (halt_resume_gap), not cold_start fail-safe. Probe the
@@ -318,5 +323,26 @@ describe('B-NEW-42 §2.3.3 — TEC halt-resilience (VERIFIES B-NEW-42b FIX)', ()
     const { _testGetSymbolEntry } = await import('../../services/price-discontinuity-detector.js');
     const entry = _testGetSymbolEntry('TSLA/USD');
     expect(entry?.activeKind).toBe('halt_resume_gap');
+  });
+
+  it('reports the venue freeze without a stop decision, then makes the same stop decision after reopening', async () => {
+    const now = 1_700_000_000_000;
+    const input = {
+      tradeId: 'TSLA/USD', symbol: 'TSLA/USD', entryPrice: 200, stopPrice: 190, targetPrice: 230,
+      currentPrice: 189, triggerPrice: 189, atr: 3, holdDurationMs: 60_000, maxHoldMs: Infinity,
+      context: xstockContext, useTrailing: true, callerMode: 'paper' as const, sentinelLane: 'paper' as const,
+    };
+    // Prime only the detector so venue freeze is the reason the first price-level check is deferred.
+    const { isDiscontinuityActive } = await import('../../services/price-discontinuity-detector.js');
+    expect(isDiscontinuityActive(input.symbol, 189, now - 1_500, 'paper')).toMatchObject({ active: true, kind: 'cold_start' });
+
+    venue.open = false;
+    const frozen = await evaluateTECExit({ ...input, currentTs: now });
+    expect(frozen).toMatchObject({ shouldExit: false, priceLevelChecksDeferred: true });
+
+    venue.open = true;
+    const reopened = await evaluateTECExit({ ...input, currentTs: now + 1_500 });
+    expect(reopened).toMatchObject({ shouldExit: true, exitReason: 'stop_hit', exitPrice: 190 });
+    expect(reopened.priceLevelChecksDeferred).toBeUndefined();
   });
 });

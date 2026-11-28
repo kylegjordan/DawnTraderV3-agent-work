@@ -212,6 +212,8 @@ export interface TECExitDecision {
    * the return shape alone cannot tell an evaluated cycle from a refused one.
    */
   noDecisionReason?: 'no_transactable_side' | 'no_usable_mark';
+  /** The venue freeze or discontinuity detector deferred price-level checks and no terminal exit was returned. */
+  priceLevelChecksDeferred?: true;
   /** Resolved constants snapshot — useful for diagnostics and parity tests. */
   resolvedConstants?: {
     breakEvenTriggerR: number;
@@ -538,6 +540,7 @@ export async function evaluateTECExit(input: TECExitInput): Promise<TECExitDecis
       shouldExit: false,
       exitReason: null,
       exitPrice: currentPrice,
+      ...(discontinuity.active || update.priceLevelChecksDeferred ? { priceLevelChecksDeferred: true as const } : {}),
       newStopPrice: update.newStopPrice,
       modeChanged: update.modeChanged,
       resolvedConstants,

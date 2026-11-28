@@ -867,6 +867,8 @@ export interface TrailingUpdateResult {
   breakEvenLatched: boolean;
   targetLatched: boolean;
   highWaterMark: number;
+  /** The xStock venue freeze skipped the trailing update and its price-level checks. */
+  priceLevelChecksDeferred?: true;
   // B65.2: when true, the caller should close the trade at currentPrice with
   // the specified exit reason. Indicates a TEC-authored terminal decision
   // (moonbag duration cap hit; mode-flip refused for qualifier/cap reasons
@@ -1055,6 +1057,7 @@ export function updatePosition(update: PositionUpdate): TrailingUpdateResult {
         breakEvenLatched: existing?.breakEvenLatched ?? false,
         targetLatched: existing?.targetLatched ?? false,
         highWaterMark: existing?.highWaterMark ?? update.currentPrice,
+        priceLevelChecksDeferred: true,
         ladderRungsHit: existing?.ladderRung ?? 0,
       };
     }

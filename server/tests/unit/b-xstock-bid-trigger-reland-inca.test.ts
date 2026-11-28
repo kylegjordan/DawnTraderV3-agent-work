@@ -23,7 +23,7 @@ import {
 } from '../../asset_classes/xstock_spot/book-state-tracker';
 import { judgeEntrySpread, resolveEntryYardstick } from '../../asset_classes/xstock_spot/entry-spread-plausibility';
 import { getDepthSnapshot } from '../../services/execution/depth-source';
-import { newExitRefusalTally, noteRefusal, noteRelease, snapshotExitRefusal, EPISODE_GAP_MS } from '../../services/exit-refusal-tally';
+import { newExitRefusalTally, noteRefusal, noteRelease, snapshotExitRefusal, EPISODE_GAP_MS, type ExitRefusalEvaluation } from '../../services/exit-refusal-tally';
 
 const SYM = 'HUT/USD';
 const K_REL = 3;
@@ -286,8 +286,47 @@ describe('P5 — the refusal-duration tally', () => {
   it('a release with no bid or no stop counts, and leaves the distance null rather than inventing one', () => {
     const tl = newExitRefusalTally(false);
     noteRefusal(tl, 'unvalidated', 0);
+    expect(noteRelease(tl, 101, 100, 1_500)).toBe(true);
+    expect(tl.lastReleaseBidToStopPct).toBe(1);
+    noteRefusal(tl, 'unvalidated', 3_000);
     expect(noteRelease(tl, null, 100)).toBe(true);
-    expect(tl.lastReleaseBidToStopPct).toBeNull();
+    expect(snapshotExitRefusal(tl)).toMatchObject({
+      releases: 2, lastReleaseBidToStopPct: null, minReleaseBidToStopPct: 1,
+    });
+  });
+
+  it('grades opposite first matched releases independently of the identical legacy summaries', () => {
+    const evaluated: ExitRefusalEvaluation = {
+      id: 'refused-evaluation', frameAtMs: 500, evaluatedAtMs: 1_000,
+      chain: {
+        chainId: 'refused-chain', seedFrameAtMs: 300, escapeReason: null,
+        restoredSeed: {
+          restoreId: 'boot-ring', writtenAtMs: 100, persistedAtMs: 200, persistedSource: 'retained',
+          seedBasis: 'judged', verdict: 'implausible', removed: false,
+        },
+      },
+    };
+    const snapshots = [99, 101].map(first => {
+      const tally = newExitRefusalTally(true);
+      noteRefusal(tally, 'yield_refused', 1_000, true, 98, 100, evaluated);
+      noteRelease(tally, first, 100, 2_000, {
+        id: 'release-evaluation', frameAtMs: 1_500, evaluatedAtMs: 2_000,
+        chain: { chainId: 'recovery-chain', seedFrameAtMs: 1_200, escapeReason: 'ring_independent_escape', restoredSeed: null },
+      });
+      noteRefusal(tally, 'unvalidated', 3_000);
+      noteRelease(tally, 99, 100, 4_000);
+      noteRefusal(tally, 'unvalidated', 5_000);
+      noteRelease(tally, null, 100, 6_000);
+      return snapshotExitRefusal(tally);
+    });
+    const [{ restoredRing: below, ...baselineBelow }, { restoredRing: above, ...baselineAbove }] = snapshots;
+    expect(baselineBelow).toEqual(baselineAbove);
+    expect(baselineBelow).toMatchObject({ lastReleaseBidToStopPct: null, minReleaseBidToStopPct: -1 });
+    expect(below?.firstMatchedRelease).toMatchObject({ direction: 'atOrBelowStop', bid: 99, stop: 100 });
+    expect(above?.firstMatchedRelease).toMatchObject({ direction: 'aboveStop', bid: 101, stop: 100 });
+    expect(above?.firstMatchedRelease?.evaluation.chain?.escapeReason).toBe('ring_independent_escape');
+    expect(above?.lastMatchedRelease).toEqual(above?.firstMatchedRelease);
+    expect(above?.unmatchedReleases).toBe(2);
   });
 });
 
@@ -297,17 +336,13 @@ describe('P5 — the refusal-duration tally', () => {
 describe('row 2 objective 6 S6 — the spread-blown stop-hold tripwire', () => {
   it('can save the same latest release summary for opposite wide-hold release directions', () => {
     const stop = 100;
-    const histories = [
-      { wideReleaseBid: 99, laterReleaseBid: null },
-      { wideReleaseBid: 101, laterReleaseBid: 99 },
-    ];
-    const snapshots = histories.map(({ wideReleaseBid, laterReleaseBid }) => {
+    const snapshots = [99, 101].map(wideReleaseBid => {
       const tally = newExitRefusalTally(false);
       noteRefusal(tally, 'yield_refused', 1_000, true, 98, stop);
       expect(noteRelease(tally, wideReleaseBid, stop, 2_000)).toBe(true);
       expect(tally.lastReleaseBidToStopPct).toBe(wideReleaseBid - stop);
       noteRefusal(tally, 'unvalidated', 3_000);
-      expect(noteRelease(tally, laterReleaseBid, stop, 4_000)).toBe(true);
+      expect(noteRelease(tally, 99, stop, 4_000)).toBe(true);
       return snapshotExitRefusal(tally);
     });
     expect(snapshots[0]).toEqual(snapshots[1]);

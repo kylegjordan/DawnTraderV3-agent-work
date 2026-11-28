@@ -411,10 +411,10 @@ import { computeStalenessCeiling, type MarkStalenessConfig } from '../asset_clas
 import { readXstockMarkStalenessConfig, readXstockSigmaCacheConfig, readXstockColdMarkMaxMs } from '../asset_classes/xstock_spot/mark-staleness-config.js';
 // B-XSTOCK-FEED-SANITY (#943, closes #567) — the book-state guard: the tracker is the one reader every
 // label site calls; the comparator advances ONLY here, after a two_sided verdict at the decision site.
-import { assessBookStateNow, advanceBookStateComparator, clearBookStateComparator, takeChainRefusalBasis, readThresholdBasis, readBookStateComparator, readRiLastMiss } from '../asset_classes/xstock_spot/book-state-tracker.js';
+import { assessBookStateNow, advanceBookStateComparator, clearBookStateComparator, takeChainRefusalBasis, readThresholdBasis, readBookStateComparator, readRiLastMiss, type BookStateNow } from '../asset_classes/xstock_spot/book-state-tracker.js';
 import { resolveEntryYardstick, judgeEntrySpread } from '../asset_classes/xstock_spot/entry-spread-plausibility.js';
 import { isXstockVenueTransitionPause } from '../asset_classes/xstock_spot/market-hours.js';
-import { newExitRefusalTally, noteRefusal, noteRelease, snapshotExitRefusal, type ExitRefusalKind, type ExitRefusalTally } from './exit-refusal-tally.js';
+import { newExitRefusalTally, noteRefusal, noteRelease, snapshotExitRefusal, type ExitRefusalEvaluation, type ExitRefusalKind, type ExitRefusalTally } from './exit-refusal-tally.js';
 import { hollowCauseIsReferenceRelative, type BookState } from '../asset_classes/xstock_spot/book-state.js';
 import { getCachedSigma, ensureSigmaFresh, type SigmaCacheConfig } from '../asset_classes/xstock_spot/sigma-rate-cache.js';
 import { selectExitTrigger, exitTriggerClass, type ExitTriggerRefusal, type XsArmOff, type XsFrameRefusal } from '../core/trading/exit-trigger.js';
@@ -567,6 +567,18 @@ const PROCESS_BOOT_TOKEN = `boot-${new Date().toISOString()}`;
 
 export function getEngineSessionStart(mode: 'live' | 'paper'): Date | null {
   return engineSessionStart.get(mode) || null;
+}
+
+function readPositionOpenedAt(position: { openedAt?: Date | string | null }): number | null {
+  const openedAtMs = position.openedAt ? new Date(position.openedAt).getTime() : NaN;
+  return Number.isFinite(openedAtMs) ? openedAtMs : null;
+}
+
+function readPositionExitRefusal(
+  tallies: ReadonlyMap<string, ExitRefusalTally>, position: { id: string; openedAt?: Date | string | null },
+): ExitRefusalTally | undefined {
+  const tally = tallies.get(position.id);
+  return tally?.position?.openedAtMs === readPositionOpenedAt(position) ? tally : undefined;
 }
 
 export class ActiveExecutionEngine {
@@ -808,15 +820,26 @@ export class ActiveExecutionEngine {
    *  that follows a venue price, so an accumulating streak is left exactly where it was (Langston Step-2 condition 1). */
   private _coldMarkTicks = 0;
   private _coldMarkPending: Map<string, { symbol: string; sinceMs: number; ticks: number; expired: boolean }> = new Map();
-  private _noteExitRefusal(position: { id: string; openedAt?: Date | string | null; stopLoss?: string | null }, kind: ExitRefusalKind, spreadBlown = false, bid: number | null = null): ExitRefusalTally {
-    let t = this._exitRefusalTally.get(position.id);
+  private _exitRefusalEvaluation(bookState: Extract<BookStateNow, { ok: true }>, evaluatedAtMs: number): ExitRefusalEvaluation {
+    return { id: randomUUID(), frameAtMs: bookState.raw.atMs, evaluatedAtMs, chain: bookState.comparatorEvidence ?? null };
+  }
+
+  private _noteExitRefusal(
+    position: { id: string; symbol: string; openedAt?: Date | string | null; stopLoss?: string | null },
+    kind: ExitRefusalKind, evaluation: ExitRefusalEvaluation, spreadBlown = false, bid: number | null = null,
+  ): ExitRefusalTally {
+    let t = readPositionExitRefusal(this._exitRefusalTally, position);
     if (!t) {
-      const _openedMs = position.openedAt ? new Date(position.openedAt).getTime() : NaN;
-      t = newExitRefusalTally(!(Number.isFinite(_openedMs) && _openedMs >= this._engineConstructedAt));
+      const openedAtMs = readPositionOpenedAt(position);
+      t = newExitRefusalTally(openedAtMs === null || openedAtMs < this._engineConstructedAt, { id: position.id, openedAtMs });
       this._exitRefusalTally.set(position.id, t);
     }
     const _stop = position.stopLoss ? parseFloat(position.stopLoss) : NaN;
-    noteRefusal(t, kind, Date.now(), spreadBlown, bid, Number.isFinite(_stop) ? _stop : null);
+    const matched = noteRefusal(t, kind, Date.now(), spreadBlown, bid, Number.isFinite(_stop) ? _stop : null, evaluation);
+    if (matched) {
+      console.warn(`[3n.q8][BOOK_STATE] ${position.symbol} RESTORED_RING_REFUSAL pos=${position.id} ` +
+        `openedAtMs=${t.position?.openedAtMs ?? 'unknown'} episode=${t.episodes} ${JSON.stringify(matched)}`);
+    }
     return t;
   }
   // ── `8a-P2` BLOCKER-2 — CONSECUTIVE NO-TRANSACTABLE-SIDE REFUSALS, PER POSITION ────────────
@@ -2647,6 +2670,7 @@ export class ActiveExecutionEngine {
         let xsAsk: number | null = null;
         let xsSideBasis: 'raw_guarded' | 'raw_unguarded' | null = null;
         let xsRawExitFrame: EquityTickRaw | null = null;
+        let xsReleaseEvaluation: ExitRefusalEvaluation | null = null;
         let xsArrivedAtMs: number | null = null;
         // Row 2 increment B (P2/P3): the SAME judged frame's shown quantities, carried with its sides (never re-read).
         let xsBidQty: number | null = null;
@@ -2839,6 +2863,7 @@ export class ActiveExecutionEngine {
               }
             } else {
               const { result: _r, cfg: _c, raw: _raw } = _bs;
+              const _bookEvaluatedAtMs = Date.now();
               xsBidTriggerArmed = _c.spreadBlownEnabled === true; // P1: guard ran + spread_blown on (see the declaration)
               if (!xsBidTriggerArmed) xsBidTriggerOff = 'spread_blown_off';
               // ⛔ D3 (2026-09-05) — THE CONSUMER `validated` NEVER HAD. Carried onto every
@@ -2951,7 +2976,8 @@ export class ActiveExecutionEngine {
                   //    (Langston C1): the engine did NOT act on this mark, so the cache must not show
                   //    that it did.
                   withoutPrice++;
-                  this._noteExitRefusal(position, 'yield_refused', _r.reasons.includes('spread_blown'), _r.inputs.bid ?? null);
+                  this._noteExitRefusal(position, 'yield_refused', this._exitRefusalEvaluation(_bs, _bookEvaluatedAtMs),
+                    _r.reasons.includes('spread_blown'), _r.inputs.bid ?? null);
                   this.observePendingMaker(position, attempt, 'upstream_refusal', false, 'book_state_yield_refused');
                   await this._recordPriceSkip(position, 'book_state_yield_refused');
                   continue;
@@ -2959,7 +2985,8 @@ export class ActiveExecutionEngine {
                   this._bookStateSkipStreak.set(position.id, _next);
                   hollowSkips++;
                   withoutPrice++;
-                  this._noteExitRefusal(position, 'hollow_skip', _r.reasons.includes('spread_blown'), _r.inputs.bid ?? null);
+                  this._noteExitRefusal(position, 'hollow_skip', this._exitRefusalEvaluation(_bs, _bookEvaluatedAtMs),
+                    _r.reasons.includes('spread_blown'), _r.inputs.bid ?? null);
                   // Row 2 objective 6, Step 4: a `spread_blown`-only SKIP prints on the run's FIRST tick and is counted after
                   // that (summary at the run's end); the tally above and the event record below still see EVERY tick.
                   const _sbOnly = _r.reasons.length === 1 && _r.reasons[0] === 'spread_blown';
@@ -3078,7 +3105,7 @@ export class ActiveExecutionEngine {
                   // condition 1): a refused tick records its spread nowhere else, so the ring-independent release's
                   // comparison is logged HERE, on the refusal side — one line per CHANGE of which clauses failed — with the
                   // position's running tally (the in-flight read gate 2 required). The ceiling is tuned from this line.
-                  const _tally = this._noteExitRefusal(position, 'unvalidated');
+                  const _tally = this._noteExitRefusal(position, 'unvalidated', this._exitRefusalEvaluation(_bs, _bookEvaluatedAtMs));
                   const _miss = readRiLastMiss(position.symbol);
                   if (_miss) {
                     // ⛔ Langston Step 4 gate 1 condition 1: one line per CHANGE of the failed set would emit ONE spread sample
@@ -3122,25 +3149,10 @@ export class ActiveExecutionEngine {
                 // ⛔ Step 4 BLOCKER-1: `two_sided` does not carry the uncrossed test, so the capture applies it.
                 xsRawExitFrame = _raw;
                 const _gSides = xstockTransactableSides(_raw); // the SAME predicate as J2
-                // ⭐ row 2 increment A, P5 — THE RELEASE: the first decided tick after a refusal episode records where the
-                // BID stood against the stop (the cost of the hold). Logged once per episode.
-                {
-                  const _t = this._exitRefusalTally.get(position.id);
-                  const _stopNum = position.stopLoss ? parseFloat(position.stopLoss) : NaN;
-                  if (_t && noteRelease(_t, _gSides ? _gSides.bid : null, Number.isFinite(_stopNum) ? _stopNum : null, Date.now())) {
-                    // Langston Step 4 gate 2 C-2: the suppressed range since the last RI_NEAR_MISS line is FLUSHED here, not
-                    // dropped — a stable refusal prints one near-miss line, so its whole range would otherwise be lost.
-                    const _accR = this._riMissAcc.get(position.id);
-                    this._riMissSig.delete(position.id);
-                    this._riMissAcc.delete(position.id);
-                    console.warn(
-                      `[B-XSTOCK-BID-TRIGGER-RELAND][BOOK_STATE] ${position.symbol} EXIT_RELEASED pos=${position.id} ` +
-                      `bidToStopPct=${_t.lastReleaseBidToStopPct === null ? 'none' : _t.lastReleaseBidToStopPct.toFixed(3)} ` +
-                      `suppressedTicks=${_accR?.n ?? 0} suppressedMinSpread=${_accR && _accR.n ? _accR.min.toFixed(5) : 'none'} ` +
-                      `suppressedMaxSpread=${_accR && _accR.n ? _accR.max.toFixed(5) : 'none'} ` +
-                      `refusedS=${Math.round(_t.refusedMs / 1000)} episodes=${_t.episodes} sinceRestart=${_t.sinceRestart}`,
-                    );
-                  }
+                const tally = readPositionExitRefusal(this._exitRefusalTally, position);
+                if (tally && tally.episodeStartMs !== null) {
+                  // Carry the book actually judged on this tick. TEC decides whether the episode can end.
+                  xsReleaseEvaluation = this._exitRefusalEvaluation(_bs, _bookEvaluatedAtMs);
                 }
                 if (_gSides) {
                   xsBid = _gSides.bid;
@@ -3659,7 +3671,7 @@ export class ActiveExecutionEngine {
               const _q = parseFloat(position.quantity);
               if (!(Number.isFinite(_q) && _q > 0)) { this._noteInvalidQuantity(position, 'trigger'); return 'size_invalid' as const; }
               return xstockSideSize('bid', { bid: xsBid, ask: xsAsk, bidQty: xsBidQty, askQty: xsAskQty }, _q * xsBid);
-            })() } : null,
+            })(), releaseEvaluation: xsReleaseEvaluation } : null,
         );
 
         if (this.xstockExitReplayPolicy && exitCondition === null && xsRawExitFrame?.frame?.kind === 'update'
@@ -4151,8 +4163,13 @@ export class ActiveExecutionEngine {
       bidRefusal: ExitTriggerRefusal | null;
       xsArm: { armed: true } | { armed: false; armOff: XsArmOff } | null;
     } = { bid: null, bidRefusal: null, xsArm: null },
-    // `8a-P4b` Step 9 C1 — LOG ONLY, never a decision input: the xStock frame the bid trigger would have read.
-    xsFrame: { bid: number | null; ask: number | null; spread: number | null; thr: number | null; basis?: string | null; reason?: string | null; trail?: number | null; ret?: number | null; tb?: 'j' | 'v' | null; size?: XstockSideSizeVerdict | 'size_invalid' | null } | null = null,
+    // The xStock frame used for diagnostics and refusal evidence. The trigger comes from exitTriggerParts.
+    xsFrame: {
+      bid: number | null; ask: number | null; spread: number | null; thr: number | null;
+      basis?: string | null; reason?: string | null; trail?: number | null; ret?: number | null; tb?: 'j' | 'v' | null;
+      size?: XstockSideSizeVerdict | 'size_invalid' | null;
+      releaseEvaluation?: ExitRefusalEvaluation | null;
+    } | null = null,
   ): Promise<ExitCondition | null> {
     // Phase 8.8.3-I6 B2: Calculate distance to SL/TP using live price
     const distanceToTP = takeProfit ? ((takeProfit - currentPrice) / currentPrice) * 100 : null;
@@ -4284,6 +4301,32 @@ export class ActiveExecutionEngine {
         // B80: Option C+ seed (only on first cycle post-restart).
         seed: tecSeedPE,
       });
+
+      // A validated book can still be crossed. Release only after TEC could check the exit, including a valid no-hit.
+      if (xsFrame && decision.noDecisionReason === undefined && !decision.priceLevelChecksDeferred) {
+        const tally = readPositionExitRefusal(this._exitRefusalTally, position);
+        // A guard-off mark decision ends the episode without a comparator match.
+        const evaluation = xsFrame.releaseEvaluation;
+        const releaseBid = evaluation ? xsFrame.bid : null;
+        if (tally && noteRelease(tally, releaseBid, stopLoss, Date.now(), evaluation ?? undefined)) {
+          // Flush the suppressed near-miss range at the end of the same episode.
+          const range = this._riMissAcc.get(position.id);
+          this._riMissSig.delete(position.id);
+          this._riMissAcc.delete(position.id);
+          console.warn(
+            `[B-XSTOCK-BID-TRIGGER-RELAND][BOOK_STATE] ${position.symbol} EXIT_RELEASED pos=${position.id} ` +
+            `bidToStopPct=${tally.lastReleaseBidToStopPct === null ? 'none' : tally.lastReleaseBidToStopPct.toFixed(3)} ` +
+            `suppressedTicks=${range?.n ?? 0} suppressedMinSpread=${range && range.n ? range.min.toFixed(5) : 'none'} ` +
+            `suppressedMaxSpread=${range && range.n ? range.max.toFixed(5) : 'none'} ` +
+            `refusedS=${Math.round(tally.refusedMs / 1000)} episodes=${tally.episodes} sinceRestart=${tally.sinceRestart}`,
+          );
+          const matched = tally.restoredRing?.lastMatchedRelease;
+          if (matched?.episode === tally.episodes) {
+            console.warn(`[3n.q8][BOOK_STATE] ${position.symbol} RESTORED_RING_RELEASE pos=${position.id} ` +
+              `openedAtMs=${tally.position?.openedAtMs ?? 'unknown'} ${JSON.stringify(matched)}`);
+          }
+        }
+      }
       // `8a-P4b` Step 9 C1 (Langston condition 4) — LOG ONLY. What the bid trigger WOULD have done on this frame, against
       // the static stop/target levels (a trailing/BE ratchet is not modelled here — stated). Two records: a suffix on
       // every xStock EXIT_TRIGGER line, and a START/END pair for each run where the bid would fire and the mark did not —
@@ -5307,7 +5350,7 @@ export class ActiveExecutionEngine {
             _carry.bookState = { ...((_bsRec as Record<string, unknown> | undefined) ?? {}), yielded: options?.exitProvenance?.bookStateYielded === true };
           }
           // row 2 increment A, P5 — the durable refusal-duration record. ALLOWLIST, like every key in this block.
-          const _erTally = this._exitRefusalTally.get(position.id);
+          const _erTally = readPositionExitRefusal(this._exitRefusalTally, position);
           if (_erTally) _carry.exitRefusal = snapshotExitRefusal(_erTally, Date.now());
           // KD-19 P2 (folds P-8e): how much of the close the captured bids held; `metadata.exitFillSplit` (no column).
           if (_fillSplit) _carry.exitFillSplit = _fillSplit;
